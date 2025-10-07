@@ -1,224 +1,113 @@
-'use client';
+// app/flock/page.tsx
+"use client";
+import { useEffect, useRef, useState } from "react";
+import BoidCanvas from "@/components/BoidCanvas";
+import ChatLog from "@/components/ChatLog";
+import AgentStatusCard from "@/components/AgentStatusCard";
 
-import { useState, useCallback } from 'react';
-import dynamic from 'next/dynamic';
-import ChatLog from '@/components/ChatLog';
-import AgentStatusCard from '@/components/AgentStatusCard';
-import { DEFAULT_GOAL } from '@/lib/agents';
-import { SimilarityMatrix } from '@/lib/types';
-
-// Dynamic import to avoid SSR issues with Three.js
-const BoidCanvas = dynamic(() => import('@/components/BoidCanvas'), {
-  ssr: false,
-  loading: () => (
-    <div className="w-full h-full flex items-center justify-center bg-gray-900">
-      <div className="text-white">Loading 3D visualization...</div>
-    </div>
-  ),
-});
-
-interface Message {
-  agentId: string;
-  agentName: string;
-  content: string;
-  turn: number;
-  color: string;
-}
+type EventPayload =
+  | { type: "start"; goal: string }
+  | { type: "agent_message"; turn: number; agent: "A" | "B" | "C"; name: string; text: string; proj: number[] }
+  | { type: "telemetry"; turn: number; agent: string; similarities: { ab: number; ac: number; bc: number; avg: number } }
+  | { type: "consensus"; turn: number; avgSimilarity: number }
+  | { type: "done" }
+  | { type: "error"; message: string };
 
 export default function FlockPage() {
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [similarities, setSimilarities] = useState<SimilarityMatrix | null>(null);
-  const [consensusReached, setConsensusReached] = useState(false);
-  const [isRunning, setIsRunning] = useState(false);
-  const [activeAgent, setActiveAgent] = useState<string | null>(null);
-  const [goal, setGoal] = useState(DEFAULT_GOAL);
-  const [customGoal, setCustomGoal] = useState('');
+  const [messages, setMessages] = useState<Array<{ agent: string; text: string; turn: number }>>([]);
+  const [positions, setPositions] = useState<Record<string, [number, number]>>({
+    A: [Math.random(), Math.random()],
+    B: [Math.random(), Math.random()],
+    C: [Math.random(), Math.random()],
+  });
+  const [avgSim, setAvgSim] = useState(0);
+  const [status, setStatus] = useState("Waiting for agents to start conversation...");
+  const readerRef = useRef<ReadableStreamDefaultReader<Uint8Array> | null>(null);
 
-  const startSimulation = useCallback(async () => {
-    // Reset state
-    setMessages([]);
-    setSimilarities(null);
-    setConsensusReached(false);
-    setIsRunning(true);
-    setActiveAgent('agent-a');
+  useEffect(() => {
+    let cancelled = false;
 
-    try {
-      const response = await fetch('/api/agents', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          goal: customGoal || goal,
-        }),
+    async function run() {
+      setStatus("Starting…");
+      const res = await fetch("/api/agents", {
+        method: "POST",
+        body: JSON.stringify({ goal: "Determine the most sustainable energy source for a lunar research outpost by 2040." }),
       });
 
-      if (!response.body) {
-        throw new Error('No response body');
-      }
-
-      const reader = response.body.getReader();
+      if (!res.body) { setStatus("No stream"); return; }
+      readerRef.current = res.body.getReader();
       const decoder = new TextDecoder();
 
-      while (true) {
-        const { done, value } = await reader.read();
+      while (!cancelled) {
+        const { value, done } = await readerRef.current.read();
         if (done) break;
+        const chunk = decoder.decode(value, { stream: true });
 
-        const chunk = decoder.decode(value);
-        const lines = chunk.split('\n');
+        // SSE: multiple "data: ..." lines can arrive per chunk
+        for (const line of chunk.split("\n\n")) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith("data:")) continue;
+          const json = trimmed.slice(5).trim();
+          if (!json) continue;
+          const evt = JSON.parse(json) as EventPayload;
 
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            try {
-              const data = JSON.parse(line.slice(6));
-
-              switch (data.type) {
-                case 'message':
-                  setMessages((prev) => [...prev, data.data]);
-                  // Update active agent (cycle through agents)
-                  const agentIndex = ['agent-a', 'agent-b', 'agent-c'].indexOf(
-                    data.data.agentId
-                  );
-                  const nextAgentIndex = (agentIndex + 1) % 3;
-                  setActiveAgent(['agent-a', 'agent-b', 'agent-c'][nextAgentIndex]);
-                  break;
-
-                case 'similarity':
-                  setSimilarities(data.data.matrix);
-                  break;
-
-                case 'consensus':
-                  setConsensusReached(true);
-                  setActiveAgent(null);
-                  break;
-
-                case 'complete':
-                  setIsRunning(false);
-                  setActiveAgent(null);
-                  break;
-              }
-            } catch (e) {
-              console.error('Error parsing SSE data:', e);
-            }
+          if (evt.type === "start") setStatus("Agents thinking…");
+          else if (evt.type === "agent_message") {
+            setMessages((m) => [...m, { agent: evt.agent, text: evt.text, turn: evt.turn }]);
+            // update “semantic” position; simple projection scaling into viewport
+            setPositions((p) => ({
+              ...p,
+              [evt.agent]: [evt.proj[0] ?? 0, evt.proj[1] ?? 0],
+            }));
+          } else if (evt.type === "telemetry") {
+            setAvgSim(evt.similarities.avg);
+          } else if (evt.type === "consensus") {
+            setAvgSim(evt.avgSimilarity);
+            setStatus(`Consensus reached (avg sim ${(evt.avgSimilarity * 100).toFixed(1)}%)`);
+          } else if (evt.type === "done") {
+            setStatus("Conversation completed.");
+          } else if (evt.type === "error") {
+            setStatus(`Error: ${evt.message}`);
           }
         }
       }
-    } catch (error) {
-      console.error('Error running simulation:', error);
-      setIsRunning(false);
-      setActiveAgent(null);
     }
-  }, [goal, customGoal]);
+
+    run();
+    return () => { cancelled = true; readerRef.current?.cancel().catch(() => { }); };
+  }, []);
 
   return (
-    <div className="h-screen flex flex-col bg-black">
-      {/* Header */}
-      <header className="bg-gray-900 border-b border-gray-800 px-6 py-4">
-        <div className="flex items-center justify-between">
-          <div>
-            <h1 className="text-2xl font-bold text-white">
-              Convergent v0.1
-            </h1>
-            <p className="text-gray-400 text-sm">
-              Triadic Consensus Simulation
-            </p>
-          </div>
-          <button
-            onClick={startSimulation}
-            disabled={isRunning}
-            className={`px-6 py-3 rounded-lg font-semibold transition-all ${
-              isRunning
-                ? 'bg-gray-700 text-gray-400 cursor-not-allowed'
-                : 'bg-blue-600 hover:bg-blue-700 text-white shadow-lg hover:shadow-xl'
-            }`}
-          >
-            {isRunning ? 'Running...' : 'Start Simulation'}
-          </button>
+    <div className="grid grid-cols-[1fr_380px] h-screen">
+      <div className="relative bg-black">
+        <BoidCanvas positions={positions} averageSimilarity={avgSim} />
+        <div className="absolute left-4 bottom-4 bg-gray-800 text-white px-3 py-2 rounded">
+          Average Similarity {(avgSim * 100).toFixed(1)}%
         </div>
-
-        {/* Goal input */}
-        <div className="mt-4">
-          <label className="text-gray-400 text-sm mb-2 block">
-            Shared Goal (leave empty for default)
-          </label>
-          <input
-            type="text"
-            value={customGoal}
-            onChange={(e) => setCustomGoal(e.target.value)}
-            disabled={isRunning}
-            placeholder={goal}
-            className="w-full bg-gray-800 text-white px-4 py-2 rounded-lg border border-gray-700 focus:border-blue-500 focus:outline-none disabled:opacity-50"
-          />
-        </div>
-      </header>
-
-      {/* Main content */}
-      <div className="flex-1 flex overflow-hidden">
-        {/* Left sidebar - Agent Status */}
-        <aside className="w-80 border-r border-gray-800 overflow-y-auto">
-          <AgentStatusCard activeAgent={activeAgent} />
-        </aside>
-
-        {/* Center - 3D Visualization */}
-        <main className="flex-1 relative">
-          <BoidCanvas
-            similarities={similarities}
-            consensusReached={consensusReached}
-          />
-        </main>
-
-        {/* Right sidebar - Chat Log */}
-        <aside className="w-96 border-l border-gray-800">
-          <ChatLog messages={messages} />
-        </aside>
       </div>
 
-      {/* Footer stats */}
-      <footer className="bg-gray-900 border-t border-gray-800 px-6 py-3">
-        <div className="flex items-center justify-between text-sm">
-          <div className="text-gray-400">
-            Messages: <span className="text-white font-semibold">{messages.length}</span>
-          </div>
-          <div className="text-gray-400">
-            Status:{' '}
-            <span
-              className={`font-semibold ${
-                consensusReached
-                  ? 'text-green-400'
-                  : isRunning
-                  ? 'text-blue-400'
-                  : 'text-gray-400'
-              }`}
-            >
-              {consensusReached
-                ? 'Consensus Reached'
-                : isRunning
-                ? 'Running'
-                : 'Idle'}
-            </span>
-          </div>
-          <div className="text-gray-400">
-            Similarity:{' '}
-            <span className="text-white font-semibold">
-              {similarities
-                ? `${(
-                    (Object.values(similarities).reduce(
-                      (sum, row) =>
-                        sum +
-                        Object.entries(row).reduce(
-                          (s, [k, v]) => (k !== Object.keys(similarities)[0] ? s + v : s),
-                          0
-                        ),
-                      0
-                    ) /
-                      6) *
-                    100
-                  ).toFixed(1)}%`
-                : 'N/A'}
-            </span>
-          </div>
-        </div>
-      </footer>
+      <aside className="bg-slate-900 text-slate-100 p-4 overflow-y-auto">
+        <div className="text-sm opacity-80 mb-3">{status}</div>
+        <ChatLog
+          messages={messages.map((m) => ({
+            agentId: m.agent,
+            agentName:
+              m.agent === "A" ? "Agent A" :
+                m.agent === "B" ? "Agent B" :
+                  m.agent === "C" ? "Agent C" :
+                    "Unknown",
+            content: m.text,
+            turn: m.turn,
+            color:
+              m.agent === "A"
+                ? "#60a5fa"   // blue
+                : m.agent === "B"
+                  ? "#34d399"   // green
+                  : "#f59e0b",  // amber
+          }))}
+        />
+
+      </aside>
     </div>
   );
 }

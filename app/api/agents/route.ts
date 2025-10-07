@@ -1,170 +1,112 @@
-import { generateText } from 'ai';
-import { openai } from '@ai-sdk/openai';
-import { anthropic } from '@ai-sdk/anthropic';
-import { google } from '@ai-sdk/google';
-import { AGENTS, DEFAULT_GOAL, MAX_TURNS, SIMILARITY_THRESHOLD } from '@/lib/agents';
-import { AgentMessage, StreamUpdate } from '@/lib/types';
-import { generateEmbedding, computeSimilarityMatrix, checkConsensus, getAverageSimilarity } from '@/lib/similarity';
+// app/api/agents/route.ts
+import { NextResponse } from "next/server";
+import { openai } from "@ai-sdk/openai";
+import { generateText, embed } from "ai"; // from Vercel AI SDK
 
-export const maxDuration = 300; // 5 minutes max
+const Agents = [
+  { id: "A", name: "Agent A", model: openai("gpt-4o"), temperature: 0.5 },
+  { id: "B", name: "Agent B", model: openai("gpt-4o"), temperature: 0.7 },
+  { id: "C", name: "Agent C", model: openai("gpt-4o"), temperature: 0.6 },
+];
+
+const EMBEDDING_MODEL = openai.embedding("text-embedding-3-small");
+
+function cosine(u: number[], v: number[]) {
+  let dot = 0, nu = 0, nv = 0;
+  for (let i = 0; i < u.length; i++) { dot += u[i]*v[i]; nu += u[i]*u[i]; nv += v[i]*v[i]; }
+  return dot / (Math.sqrt(nu) * Math.sqrt(nv));
+}
 
 export async function POST(req: Request) {
-  const encoder = new TextEncoder();
   const { goal } = await req.json();
-  const conversationGoal = goal || DEFAULT_GOAL;
 
   const stream = new ReadableStream({
     async start(controller) {
+      const send = (type: string, data: any) => {
+        controller.enqueue(
+          new TextEncoder().encode(`data: ${JSON.stringify({ type, ...data })}\n\n`)
+        );
+      };
+
       try {
-        const messages: AgentMessage[] = [];
-        let consensusReached = false;
+        send("start", { goal });
 
-        // Helper function to send updates to client
-        const sendUpdate = (update: StreamUpdate) => {
-          controller.enqueue(
-            encoder.encode(`data: ${JSON.stringify(update)}\n\n`)
-          );
-        };
+        const transcript: string[] = [];
+        const lastVec: Record<string, number[]> = {};
 
-        // Initial system message for context
-        const systemPrompt = `You are participating in a collaborative discussion with two other AI agents. Your goal is: "${conversationGoal}"
+        const maxTurns = 5;
+        for (let turn = 1; turn <= maxTurns; turn++) {
+          for (const agent of Agents) {
+            const prompt = `
+You are ${agent.name}. Work towards consensus with two peers.
+Goal: ${goal}
 
-Please provide thoughtful, evidence-based reasoning. Consider the perspectives of other agents and work toward a consensus solution.`;
+Previous messages:
+${transcript.map((m, i) => `Step ${i + 1}: ${m}`).join("\n")}
 
-        // Round-robin conversation loop
-        for (let turn = 0; turn < MAX_TURNS && !consensusReached; turn++) {
-          console.log(`\n=== Turn ${turn + 1} ===`);
+Respond concisely (<=120 tokens), reference peers' points, and propose either:
+- a synthesis toward consensus, or
+- a specific next question to resolve blocking uncertainty.
+`;
 
-          // Each agent responds in sequence
-          for (const agent of AGENTS) {
-            console.log(`\n${agent.name} is thinking...`);
+            const result = await generateText({
+              model: agent.model,
+              temperature: agent.temperature,
+              messages: [{ role: "user", content: prompt }],
+            });
 
-            // Build conversation history for this agent
-            const conversationHistory = messages.map((msg) => ({
-              role: 'assistant' as const,
-              content: `[${msg.agentName}]: ${msg.content}`,
-            }));
+            const text = result.text.trim();
+            transcript.push(`${agent.name}: ${text}`);
 
-            // Determine the model provider
-            let modelProvider;
-            if (agent.model.startsWith('gpt')) {
-              modelProvider = openai(agent.model);
-            } else if (agent.model.startsWith('claude')) {
-              modelProvider = anthropic(agent.model);
-            } else if (agent.model.startsWith('gemini')) {
-              modelProvider = google(agent.model);
-            } else {
-              throw new Error(`Unknown model: ${agent.model}`);
+            // Embed this thought
+            const { embedding } = await embed({ model: EMBEDDING_MODEL, value: text });
+            lastVec[agent.id] = embedding;
+
+            // Compute pairwise similarity if we have all three
+            let avgSim = null;
+            if (lastVec["A"] && lastVec["B"] && lastVec["C"]) {
+              const ab = cosine(lastVec["A"], lastVec["B"]);
+              const ac = cosine(lastVec["A"], lastVec["C"]);
+              const bc = cosine(lastVec["B"], lastVec["C"]);
+              avgSim = (ab + ac + bc) / 3;
+              send("telemetry", {
+                turn, agent: agent.id, similarities: { ab, ac, bc, avg: avgSim },
+              });
             }
 
-            // Generate agent response
-            const result = await generateText({
-              model: modelProvider,
-              temperature: agent.temperature,
-              messages: [
-                { role: 'system', content: systemPrompt },
-                ...conversationHistory,
-                {
-                  role: 'user',
-                  content:
-                    turn === 0 && agent.id === 'agent-a'
-                      ? `Please start the discussion by proposing an initial stance on: ${conversationGoal}`
-                      : `Based on the discussion so far, please provide your perspective, critique, or synthesis.`,
-                },
-              ],
+            // Push the agent message + its embedding vector length (to avoid huge payloads)
+            send("agent_message", {
+              turn,
+              agent: agent.id,
+              name: agent.name,
+              text,
+              // for the client, send a tiny projection seed: first 2 dims
+              proj: embedding.slice(0, 2),
             });
 
-            const content = result.text;
-            console.log(`${agent.name}: ${content.substring(0, 100)}...`);
-
-            // Generate embedding for the response
-            const embedding = await generateEmbedding(content);
-
-            // Create message object
-            const message: AgentMessage = {
-              agentId: agent.id,
-              agentName: agent.name,
-              content,
-              embedding,
-              timestamp: Date.now(),
-              turn: turn + 1,
-            };
-
-            messages.push(message);
-
-            // Send message update to client
-            sendUpdate({
-              type: 'message',
-              data: {
-                agentId: agent.id,
-                agentName: agent.name,
-                content,
-                turn: turn + 1,
-                color: agent.color,
-              },
-            });
-          }
-
-          // After all agents have responded, compute similarity matrix
-          const embeddings = messages
-            .slice(-3)
-            .map((msg) => ({
-              agentId: msg.agentId,
-              embedding: msg.embedding,
-            }));
-
-          const similarityMatrix = computeSimilarityMatrix(embeddings);
-          const avgSimilarity = getAverageSimilarity(similarityMatrix);
-          consensusReached = checkConsensus(similarityMatrix, SIMILARITY_THRESHOLD);
-
-          console.log(`Average similarity: ${avgSimilarity.toFixed(3)}`);
-          console.log(`Consensus reached: ${consensusReached}`);
-
-          // Send similarity update to client
-          sendUpdate({
-            type: 'similarity',
-            data: {
-              matrix: similarityMatrix,
-              average: avgSimilarity,
-              turn: turn + 1,
-            },
-          });
-
-          // Check for consensus
-          if (consensusReached) {
-            sendUpdate({
-              type: 'consensus',
-              data: {
-                turn: turn + 1,
-                avgSimilarity,
-              },
-            });
-            break;
+            // Optional: early stop when highly aligned
+            if (avgSim !== null && avgSim > 0.90) {
+              send("consensus", { turn, avgSimilarity: avgSim });
+              controller.close();
+              return;
+            }
           }
         }
 
-        // Send completion signal
-        sendUpdate({
-          type: 'complete',
-          data: {
-            consensusReached,
-            totalMessages: messages.length,
-          },
-        });
-
+        send("done", {});
         controller.close();
-      } catch (error) {
-        console.error('Error in agent orchestration:', error);
-        controller.error(error);
+      } catch (err: any) {
+        send("error", { message: err?.message ?? String(err) });
+        controller.close();
       }
     },
   });
 
   return new Response(stream, {
     headers: {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      Connection: 'keep-alive',
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
     },
   });
 }
