@@ -115,9 +115,18 @@ export default function ControlsPanel({ running, onStart, onStop }: Props) {
           value={vpText}
           onChange={(e) => setVpText(e.target.value)}
           disabled={running}
+          placeholder={`Public Safety | humor=light, direction=decider, rigor=data
+Individual Rights | humor=dry, direction=explorer, rigor=balanced
+Pragmatic Center | direction=wanderer, rigor=balanced`}
         />
+        <p className="mt-1 text-[11px] text-slate-400">
+          Optional traits: <code>humor=none|light|dry|playful</code>,{' '}
+          <code>direction=wanderer|explorer|decider</code>,{' '}
+          <code>rigor=anecdotal|balanced|data</code>,{' '}
+          <code>naivety=low|med|high</code>, <code>optimism=low|med|high</code>,{' '}
+          <code>snark=low|med|high</code>.
+        </p>
       </label>
-
       <div className="grid grid-cols-2 gap-3">
         <label className="block text-sm">
           Agents (start)

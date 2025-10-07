@@ -2,156 +2,136 @@
 'use client';
 
 import { Canvas, useFrame } from '@react-three/fiber';
-import { Html } from '@react-three/drei';
 import { useMemo, useRef } from 'react';
 import * as THREE from 'three';
 
-// --- helpers ---
-function lerp01(a: number, b: number, t: number) { return a + (b - a) * Math.min(1, Math.max(0, t)); }
-function glowIntensity(last?: number, now = Date.now(), halfLife = 5000) { // was 900
-  if (!last) return 0;
-  const dt = Math.max(0, now - last);
-  const k = Math.log(2) / halfLife;
-  return Math.exp(-k * dt);
+function Halo({ intensity, color }: { intensity: number; color: string }) {
+  // simple expanding transparent sphere as glow
+  const ref = useRef<THREE.Mesh>(null);
+  useFrame(() => {
+    if (!ref.current) return;
+    const s = 1 + intensity * 0.8;
+    ref.current.scale.setScalar(s);
+  });
+  return (
+    <mesh ref={ref}>
+      <sphereGeometry args={[0.06, 16, 16]} />
+      <meshBasicMaterial color={color} transparent opacity={0.25 * intensity} />
+    </mesh>
+  );
+}
+
+function SpeakingIcon({ intensity, color }: { intensity: number; color: string }) {
+  // tiny dot “badge” offset above the agent
+  const y = 0.08 + intensity * 0.02;
+  return (
+    <mesh position={[0, y, 0]}>
+      <sphereGeometry args={[0.015, 8, 8]} />
+      <meshBasicMaterial color={color} />
+    </mesh>
+  );
 }
 
 function Agent({
-  color, pos, speakAt, label, bubbleHalfLifeMs = 3200,   // NEW prop with default
+  color,
+  pos,
+  freshness,
 }: {
   color: string;
   pos: [number, number];
-  speakAt?: number;
-  label?: string;
-  bubbleHalfLifeMs?: number;
+  freshness: number; // 0..1 how recently spoke
 }) {
   const ref = useRef<THREE.Mesh>(null);
-
   useFrame(() => {
     if (!ref.current) return;
     const target = new THREE.Vector3(pos[0], pos[1], 0);
-    ref.current.position.lerp(target, 0.22); // slightly snappier
-    const gi = glowIntensity(speakAt, Date.now(), bubbleHalfLifeMs);
-    const s = lerp01(1, 1.25, gi);          // subtler size pulse
-    ref.current.scale.set(s, s, s);
-    const mat = ref.current.material as THREE.MeshStandardMaterial;
-    if (mat) {
-      mat.emissive = new THREE.Color(color);
-      mat.emissiveIntensity = 0.45 * gi;    // softer glow
-    }
+    ref.current.position.lerp(target, 0.1);
   });
-
-  const gi = glowIntensity(speakAt, Date.now(), bubbleHalfLifeMs);
 
   return (
     <group>
+      {/* base dot */}
       <mesh ref={ref}>
-        <sphereGeometry args={[0.032, 16, 16]} /> {/* a touch smaller */}
+        <sphereGeometry args={[0.03, 16, 16]} />
         <meshStandardMaterial color={color} />
       </mesh>
 
-      {/* Chat bubble: smaller font, narrower width, lingers longer */}
-      {gi > 0.12 && !!label && (
-        <Html transform distanceFactor={3.6} position={[pos[0], pos[1] + 0.085, 0]}>
-          <div
-            style={{
-              background: 'rgba(17,24,39,0.92)',
-              color: 'white',
-              border: '1px solid rgba(148,163,184,0.35)',
-              borderRadius: 8,
-              padding: '3px 5px',        // smaller
-              maxWidth: 140,             // narrower
-              fontSize: 10,              // smaller font
-              lineHeight: 1.22,
-              boxShadow: '0 2px 8px rgba(0,0,0,0.35)',
-              opacity: gi,
-              transform: `scale(${0.9 + gi * 0.1})`,
-              pointerEvents: 'none',
-              whiteSpace: 'pre-wrap',
-            }}
-          >
-            {label}
-          </div>
-        </Html>
+      {/* animated halo + icon, intensity decays */}
+      {freshness > 0.02 && (
+        <group>
+          <group position={[pos[0], pos[1], 0]}>
+            <Halo intensity={freshness} color={color} />
+            <SpeakingIcon intensity={freshness} color={color} />
+          </group>
+        </group>
       )}
     </group>
   );
 }
 
-function ProximityLinks({
-  positions,
-  talkRadius,
-}: {
-  positions: Record<string, [number, number]>;
-  talkRadius: number;
-}) {
-  const lines = useMemo(() => {
-    const entries = Object.entries(positions);
-    const segs: { a: [number, number]; b: [number, number]; d: number }[] = [];
-    for (let i = 0; i < entries.length; i++) {
-      for (let j = i + 1; j < entries.length; j++) {
-        const [, A] = entries[i];
-        const [, B] = entries[j];
-        const d = Math.hypot(A[0] - B[0], A[1] - B[1]);
-        if (d <= talkRadius) segs.push({ a: A, b: B, d });
-      }
-    }
-    return segs;
-  }, [positions, talkRadius]);
-
-  return (
-    <>
-      {lines.map((seg, idx) => (
-        <line key={idx}>
-          <bufferGeometry>
-            {/* IMPORTANT: use args to construct BufferAttribute */}
-            <bufferAttribute
-              attach="attributes-position"
-              args={[new Float32Array([seg.a[0], seg.a[1], 0, seg.b[0], seg.b[1], 0]), 3]}
-            />
-          </bufferGeometry>
-          {/* opacity strengthens as agents get closer */}
-          <lineBasicMaterial transparent opacity={1 - seg.d / talkRadius} />
-        </line>
-      ))}
-    </>
-  );
-}
-
-
 export default function BoidCanvas({
-  positions, colors, averageSimilarity, speakingTimes, talkRadius = 0.28, bubbles = {},
-  bubbleHalfLifeMs = 3200,            // NEW
+  positions,
+  colors,
+  averageSimilarity,
+  lastSpokeAt,
+  talkRadius = 0.28,
 }: {
   positions: Record<string, [number, number]>;
   colors: Record<string, string>;
   averageSimilarity: number;
-  speakingTimes?: Record<string, number>;
+  lastSpokeAt: Record<string, number>; // ms timestamps
   talkRadius?: number;
-  bubbles?: Record<string, string>;
-  bubbleHalfLifeMs?: number;          // NEW
 }) {
-  const clamp2 = ([x, y]: [number, number]) => [THREE.MathUtils.clamp(x, -1, 1), THREE.MathUtils.clamp(y, -1, 1)] as [number, number];
+  // map to clipped coordinates
+  const map = ([x, y]: [number, number]) =>
+    [THREE.MathUtils.clamp(x, -1, 1), THREE.MathUtils.clamp(y, -1, 1)] as [number, number];
+
+  // build proximity segments buffer (pairs within talkRadius)
+  const verts = useMemo(() => {
+    const ids = Object.keys(positions);
+    const arr: number[] = [];
+    for (let i = 0; i < ids.length; i++) {
+      for (let j = i + 1; j < ids.length; j++) {
+        const a = positions[ids[i]];
+        const b = positions[ids[j]];
+        const dx = a[0] - b[0], dy = a[1] - b[1];
+        const d = Math.hypot(dx, dy);
+        if (d <= talkRadius) {
+          // push two vertices (segment AB)
+          arr.push(a[0], a[1], 0, b[0], b[1], 0);
+        }
+      }
+    }
+    return new Float32Array(arr);
+  }, [positions, talkRadius]);
+
+  const now = Date.now();
+  const freshness = (id: string) => {
+    const t = lastSpokeAt[id] ?? 0;
+    const age = (now - t) / 1500; // 1.5s half-life-ish
+    const f = Math.max(0, 1 - age);
+    return f;
+  };
 
   return (
-    <Canvas
-      camera={{ position: [0, 0, 2.2] }}
-      onCreated={({ gl }) => { gl.setPixelRatio(Math.min(window.devicePixelRatio, 2)); }}
-    >
+    <Canvas camera={{ position: [0, 0, 2.2] }}>
       <ambientLight />
       <pointLight position={[2, 2, 3]} intensity={1.2} />
 
-      <ProximityLinks positions={positions} talkRadius={talkRadius} />
+      {/* proximity lines */}
+      {verts.length > 0 && (
+        <lineSegments>
+          <bufferGeometry>
+            {/* Use constructor args: new THREE.BufferAttribute(verts, 3) */}
+            <bufferAttribute attach="attributes-position" args={[verts, 3]} />
+          </bufferGeometry>
+          <lineBasicMaterial color="#94a3b8" transparent opacity={0.28 + 0.2 * averageSimilarity} />
+        </lineSegments>
+      )}
 
+      {/* agents */}
       {Object.entries(positions).map(([id, p]) => (
-        <Agent
-          key={id}
-          color={colors[id] ?? '#94a3b8'}
-          pos={clamp2(p)}
-          speakAt={speakingTimes?.[id]}
-          label={bubbles[id]}
-          bubbleHalfLifeMs={bubbleHalfLifeMs}   // <-- NEW
-        />
-
+        <Agent key={id} color={colors[id] ?? '#94a3b8'} pos={map(p)} freshness={freshness(id)} />
       ))}
     </Canvas>
   );
