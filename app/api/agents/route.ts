@@ -111,6 +111,22 @@ function parseViewpoints(raw: unknown): ViewCard[] {
   return out;
 }
 
+/** ---------- Topic anchoring helpers ---------- */
+const STOPWORDS = new Set([
+  "the","a","an","to","and","or","for","of","in","by","on","with","at","as","is","are","be","was","were","that","this","these","those","from","about","into","over","under","vs","versus","within","out","up","down","how","what","when","where","why","which"
+]);
+
+function anchorsFromGoal(goal: string, n = 6): string[] {
+  const words = goal
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, " ")
+    .split(/\s+/)
+    .filter(w => w.length > 3 && !STOPWORDS.has(w));
+  const uniq: string[] = [];
+  for (const w of words) if (!uniq.includes(w)) uniq.push(w);
+  return uniq.slice(0, n);
+}
+
 /** ---------- Conversation moves ---------- */
 const MOVES = [
   "ASK", "CHALLENGE", "BUILD", "STORY", "ANALOGY", "DATA_POINT", "SYNTHESIZE", "DECIDE"
@@ -164,6 +180,9 @@ export async function POST(req: Request) {
     viewpoints: parseViewpoints(body?.viewpoints ?? body?.config?.viewpoints ?? []),
     tempJitter: clamp(body?.tempJitter ?? 0.2, 0, 0.8),
   };
+
+  // compute anchor terms from goal
+  const anchors = anchorsFromGoal(cfg.goal);
 
   // Agent pool
   const pool: Agent[] = Array.from({ length: 12 }).map((_, i) => {
@@ -363,15 +382,22 @@ You are ${agent.name}.
 Persona: ${personaStance.toUpperCase()} — ${styleNote}
 Viewpoint: ${agent.viewpoint?.label ?? "None"}${agent.viewpoint?.desc ? " — " + agent.viewpoint?.desc : ""}
 
+TOPIC (do not restate verbatim): ${cfg.goal}
+ANCHOR TERMS: ${anchors.join(", ")}
+
 VOICE TRAITS
 - Humor: ${tr.humor ?? "none"}${tr.humor && tr.humor!=="none" ? " (one **very** short aside allowed occasionally)" : ""}
-- Naivety: ${tr.naivety ?? "med"}   - Direction: ${tr.direction ?? "explorer"}
-- Rigor: ${tr.rigor ?? "balanced"}  - Optimism: ${tr.optimism ?? "med"} - Snark: ${tr.snark ?? "low"}
+- Naivety: ${tr.naivety ?? "med"}
+- Direction: ${tr.direction ?? "explorer"}
+- Rigor: ${tr.rigor ?? "balanced"}
+- Optimism: ${tr.optimism ?? "med"}
+- Snark: ${tr.snark ?? "low"}
 
-Hard rules:
-- DO NOT restate or paraphrase the overall goal. Start mid-conversation with substance.
-- Keep it brief (<= ${cfg.maxTokens} tokens). 1–2 short paragraphs or a compact list.
-- Prefer concrete {claim, reason, example, datum, or clear next step}.
+TOPIC RULES
+- Stay tightly scoped to the TOPIC. Every point must connect back to it in at least one short clause.
+- Use at least one ANCHOR TERM when you make a claim or propose a step.
+- Avoid unrelated detours (e.g., generic policing/surveillance) unless you clearly tie them to the TOPIC via a named mechanism that affects the decision (cost, timeline, reliability, risk, etc.).
+- Keep it brief (<= ${cfg.maxTokens} tokens). Use 1–2 short paragraphs or a compact list.
 `.trim();
 
               const moveGuide =
@@ -395,6 +421,9 @@ Recent local context (last ${cfg.maxContextMessages} msgs):
 ${ctx.map((m, i) => `#${i + 1} ${m.speaker}: ${m.text}`).join("\n")}
 
 MOVE: ${move}. Guidance: ${moveGuide}. ${peerHint}
+
+Before you answer, quickly check: does your draft explicitly connect to the TOPIC using at least one ANCHOR TERM?
+- If not, add one brief bridging clause that ties your point back to the TOPIC.
 
 At the very end, append a single meta tag of the form:
 <META stance={-1|0|+1} proposal="very short title of the step you support or '' if none">
