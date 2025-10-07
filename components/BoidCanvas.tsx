@@ -6,7 +6,6 @@ import { useMemo, useRef } from 'react';
 import * as THREE from 'three';
 
 function Halo({ intensity, color }: { intensity: number; color: string }) {
-  // simple expanding transparent sphere as glow
   const ref = useRef<THREE.Mesh>(null);
   useFrame(() => {
     if (!ref.current) return;
@@ -22,7 +21,6 @@ function Halo({ intensity, color }: { intensity: number; color: string }) {
 }
 
 function SpeakingIcon({ intensity, color }: { intensity: number; color: string }) {
-  // tiny dot “badge” offset above the agent
   const y = 0.08 + intensity * 0.02;
   return (
     <mesh position={[0, y, 0]}>
@@ -39,7 +37,7 @@ function Agent({
 }: {
   color: string;
   pos: [number, number];
-  freshness: number; // 0..1 how recently spoke
+  freshness: number; // 0..1 recency glow
 }) {
   const ref = useRef<THREE.Mesh>(null);
   useFrame(() => {
@@ -50,19 +48,15 @@ function Agent({
 
   return (
     <group>
-      {/* base dot */}
       <mesh ref={ref}>
         <sphereGeometry args={[0.03, 16, 16]} />
         <meshStandardMaterial color={color} />
       </mesh>
 
-      {/* animated halo + icon, intensity decays */}
       {freshness > 0.02 && (
-        <group>
-          <group position={[pos[0], pos[1], 0]}>
-            <Halo intensity={freshness} color={color} />
-            <SpeakingIcon intensity={freshness} color={color} />
-          </group>
+        <group position={[pos[0], pos[1], 0]}>
+          <Halo intensity={freshness} color={color} />
+          <SpeakingIcon intensity={freshness} color={color} />
         </group>
       )}
     </group>
@@ -82,11 +76,10 @@ export default function BoidCanvas({
   lastSpokeAt: Record<string, number>; // ms timestamps
   talkRadius?: number;
 }) {
-  // map to clipped coordinates
   const map = ([x, y]: [number, number]) =>
     [THREE.MathUtils.clamp(x, -1, 1), THREE.MathUtils.clamp(y, -1, 1)] as [number, number];
 
-  // build proximity segments buffer (pairs within talkRadius)
+  // Build proximity line segments
   const verts = useMemo(() => {
     const ids = Object.keys(positions);
     const arr: number[] = [];
@@ -94,10 +87,10 @@ export default function BoidCanvas({
       for (let j = i + 1; j < ids.length; j++) {
         const a = positions[ids[i]];
         const b = positions[ids[j]];
-        const dx = a[0] - b[0], dy = a[1] - b[1];
+        const dx = a[0] - b[0];
+        const dy = a[1] - b[1];
         const d = Math.hypot(dx, dy);
         if (d <= talkRadius) {
-          // push two vertices (segment AB)
           arr.push(a[0], a[1], 0, b[0], b[1], 0);
         }
       }
@@ -108,9 +101,8 @@ export default function BoidCanvas({
   const now = Date.now();
   const freshness = (id: string) => {
     const t = lastSpokeAt[id] ?? 0;
-    const age = (now - t) / 1500; // 1.5s half-life-ish
-    const f = Math.max(0, 1 - age);
-    return f;
+    const age = (now - t) / 1500; // fades over ~1.5s
+    return Math.max(0, 1 - age);
   };
 
   return (
@@ -118,12 +110,21 @@ export default function BoidCanvas({
       <ambientLight />
       <pointLight position={[2, 2, 3]} intensity={1.2} />
 
-      {/* proximity lines */}
+      {/* proximity links */}
       {verts.length > 0 && (
         <lineSegments>
           <bufferGeometry>
-            {/* Use constructor args: new THREE.BufferAttribute(verts, 3) */}
+            {/* Preferred typing across r3f versions */}
             <bufferAttribute attach="attributes-position" args={[verts, 3]} />
+            {/*
+            // If your TS/r3f combo prefers explicit props, swap to:
+            <bufferAttribute
+              attach="attributes-position"
+              array={verts}
+              itemSize={3}
+              count={verts.length / 3}
+            />
+            */}
           </bufferGeometry>
           <lineBasicMaterial color="#94a3b8" transparent opacity={0.28 + 0.2 * averageSimilarity} />
         </lineSegments>

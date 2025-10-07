@@ -38,7 +38,7 @@ type Agent = {
   id: string;
   name: string;
   color: string;
-  model: any; // Consider refining this type if possible
+  model: any; // underlying model handle from @ai-sdk/openai
   persona: Persona;
   viewpoint?: ViewCard;
 };
@@ -56,8 +56,9 @@ function sub(a: [number, number], b: [number, number]) { return [a[0] - b[0], a[
 function mul(a: [number, number], s: number) { return [a[0] * s, a[1] * s] as [number, number]; }
 function mag(v: [number, number]) { return Math.hypot(v[0], v[1]); }
 function setMag(v: [number, number], m: number) { const k = mag(v) || 1e-6; return [v[0] * m / k, v[1] * m / k] as [number, number]; }
-function shuffle<T>(arr: T[]) { for (let i = arr.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1));[arr[i], arr[j]] = [arr[j], arr[i]]; } return arr; }
+function shuffle<T>(arr: T[]) { for (let i = arr.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [arr[i], arr[j]] = [arr[j], arr[i]]; } return arr; }
 function sample<T>(arr: T[]) { return arr[Math.floor(Math.random() * arr.length)]; }
+const normalize = (s: string) => s.toLowerCase().trim().replace(/\s+/g, " ");
 
 /** ---------- Personas ---------- */
 type Persona = { stance: "collab" | "skeptic" | "contrarian"; baseTemp: number; styleNote: string; };
@@ -79,13 +80,10 @@ type VoiceTraits = {
 
 type ViewCard = { label: string; desc?: string; traits: VoiceTraits };
 
-
-
 function parseViewpoints(raw: unknown): ViewCard[] {
   const lines: string[] =
-    Array.isArray(raw) ? raw.map(String) :
-      typeof raw === "string" ? raw.split(/\r?\n|,/) :
-        [];
+    Array.isArray(raw) ? raw.map(String)
+    : typeof raw === "string" ? raw.split(/\r?\n|,/) : [];
   const out: ViewCard[] = [];
   for (const line0 of lines) {
     const line = String(line0).trim();
@@ -293,6 +291,8 @@ export async function POST(req: Request) {
     return out;
   }
 
+  const CONSENSUS_THRESH = 0.6;
+
   const stream = new ReadableStream({
     async start(controller) {
       const send = (payload: any) =>
@@ -328,6 +328,8 @@ export async function POST(req: Request) {
 
           // clusters randomized
           const comps = shuffle(clusters());
+          const consensusOut: Array<{ size: number; support: number; proposal: string }> = [];
+
           for (const comp of comps) {
             if (!comp.length) continue;
 
@@ -339,13 +341,16 @@ export async function POST(req: Request) {
             });
             const speakers = (candidates.length ? candidates : [sample(comp)]).slice(0, 3);
 
+            type Vote = { stance: number; proposal: string };
+            const votes: Vote[] = [];
+
             for (const agentId of speakers) {
               const agent: Agent = pool.find(a => a.id === agentId)!;
               const peerCandidates = comp.filter(id => id !== agentId);
               const targetPeer = peerCandidates.length ? sample(peerCandidates) : undefined;
               const ctx = transcript.filter(m => comp.includes(m.speaker)).slice(-cfg.maxContextMessages);
 
-              const { stance, baseTemp, styleNote } = agent.persona;
+              const { stance: personaStance, baseTemp, styleNote } = agent.persona;
               const tRand = (cfg.tempJitter ?? 0.2) * (Math.random() * 2 - 1);
               const tr = agent.viewpoint?.traits ?? {};
               const humorKick = tr.humor === "playful" ? 0.05 : tr.humor === "dry" ? 0.02 : 0;
@@ -354,53 +359,46 @@ export async function POST(req: Request) {
               const move = pickMove(tr);
 
               const system = `
-    You are ${agent.name}.
-    Persona: ${stance.toUpperCase()} — ${styleNote}
-    Viewpoint: ${agent.viewpoint?.label ?? "None"}${agent.viewpoint?.desc ? " — " + agent.viewpoint?.desc : ""}
+You are ${agent.name}.
+Persona: ${personaStance.toUpperCase()} — ${styleNote}
+Viewpoint: ${agent.viewpoint?.label ?? "None"}${agent.viewpoint?.desc ? " — " + agent.viewpoint?.desc : ""}
 
-    VOICE TRAITS
-    - Humor: ${tr.humor ?? "none"}${tr.humor && tr.humor !== "none" ? " (one **very short** witty aside allowed occasionally)" : ""}
-    - Naivety: ${tr.naivety ?? "med"}
-    - Direction: ${tr.direction ?? "explorer"}
-    - Rigor: ${tr.rigor ?? "balanced"}
-    - Optimism: ${tr.optimism ?? "med"}
-    - Snark: ${tr.snark ?? "low"}
+VOICE TRAITS
+- Humor: ${tr.humor ?? "none"}${tr.humor && tr.humor!=="none" ? " (one **very** short aside allowed occasionally)" : ""}
+- Naivety: ${tr.naivety ?? "med"}   - Direction: ${tr.direction ?? "explorer"}
+- Rigor: ${tr.rigor ?? "balanced"}  - Optimism: ${tr.optimism ?? "med"} - Snark: ${tr.snark ?? "low"}
 
-    Obey the selected conversational MOVE this turn: **${move}**.
-    Keep replies tight (<= ${cfg.maxTokens} tokens). Avoid wall-of-text. Use one or two short paragraphs or a compact list.
-  `.trim();
+Hard rules:
+- DO NOT restate or paraphrase the overall goal. Start mid-conversation with substance.
+- Keep it brief (<= ${cfg.maxTokens} tokens). 1–2 short paragraphs or a compact list.
+- Prefer concrete {claim, reason, example, datum, or clear next step}.
+`.trim();
 
               const moveGuide =
-                move === "ASK" ? "Ask one sharp question that moves the discussion forward; include a brief reason why it matters."
-                  : move === "CHALLENGE" ? "Challenge a specific claim nearby. Be precise and civil; give one reason or counterexample."
-                    : move === "BUILD" ? "Build directly on a peer's idea, merging it with your viewpoint. Add one incremental improvement."
-                      : move === "STORY" ? "Share a tiny (1–2 sentence) anecdote illustrating the trade-off; keep it concrete."
-                        : move === "ANALOGY" ? "Offer a short analogy/metaphor that clarifies the choice; keep it fresh, not cliché."
-                          : move === "DATA_POINT" ? "Bring one concrete datum (approximate is fine) and say how it changes the decision."
-                            : move === "SYNTHESIZE" ? "Summarize 2–3 key points from the cluster and highlight the crux."
-                              : "Propose one **actionable next step** or decision with a clear justification.";
+                move === "ASK" ? "Ask one sharp question and say why it matters."
+                  : move === "CHALLENGE" ? "Challenge a specific claim; be civil; give one reason or counterexample."
+                    : move === "BUILD" ? "Build directly on a peer's idea and add one improvement."
+                      : move === "STORY" ? "1–2 sentence anecdote illustrating the trade-off."
+                        : move === "ANALOGY" ? "Short analogy that clarifies the choice."
+                          : move === "DATA_POINT" ? "Bring one concrete datum and how it changes the decision."
+                            : move === "SYNTHESIZE" ? "Summarize 2–3 points and highlight the crux."
+                              : "Propose one actionable next step or decision with justification.";
 
               const peerHint = targetPeer
-                ? `Directly address **${targetPeer}** in one sentence.`
+                ? `Directly address ${targetPeer} in one sentence.`
                 : `Address the cluster concisely.`;
 
               const prompt = `
-                Goal: ${cfg.goal}
+Cluster peers you can hear: ${comp.join(", ")}
 
-                Nearby peers you can hear: ${comp.join(", ")}
+Recent local context (last ${cfg.maxContextMessages} msgs):
+${ctx.map((m, i) => `#${i + 1} ${m.speaker}: ${m.text}`).join("\n")}
 
-                Recent local context (last ${cfg.maxContextMessages} msgs):
-                ${ctx.map((m, i) => `#${i + 1} ${m.speaker}: ${m.text}`).join("\n")}
+MOVE: ${move}. Guidance: ${moveGuide}. ${peerHint}
 
-                MOVE to perform: ${move}.
-                Guidance: ${moveGuide}
-                ${peerHint}
-
-                Rules:
-                - Add **substance**: include at least one of {claim, reason, example, datum, concrete next step}.
-                - If you change your mind, admit it briefly.
-                - Avoid repeating prior text; be incremental.
-                `.trim();
+At the very end, append a single meta tag of the form:
+<META stance={-1|0|+1} proposal="very short title of the step you support or '' if none">
+`.trim();
 
               const result = await generateText({
                 model: agent.model,
@@ -413,8 +411,20 @@ export async function POST(req: Request) {
               });
 
               const text = result.text.trim();
-              transcript.push({ speaker: agent.id, text });
+              // Parse <META stance=... proposal="...">
+              let voteStance = 0;
+              let proposal = "";
+              const m = text.match(/<META\s+stance\s*=\s*([+\-]?\d)\s+proposal\s*=\s*"([^"]*)"\s*>/i);
+              if (m) {
+                voteStance = Math.max(-1, Math.min(1, parseInt(m[1], 10) || 0));
+                proposal = (m[2] || "").slice(0, 120).trim();
+              }
+              const textClean = text.replace(/<META[^>]*>/gi, "").trim();
+
+              transcript.push({ speaker: agent.id, text: textClean });
               heat[agent.id] = 1.0;
+
+              votes.push({ stance: voteStance, proposal });
 
               send({
                 type: "agent_message",
@@ -422,18 +432,48 @@ export async function POST(req: Request) {
                 agent: agent.id,
                 name: agent.name,
                 color: agent.color,
-                text,
+                text: textClean,
                 proj: [pos[agent.id][0], pos[agent.id][1]],
                 active: Array.from(active),
+                vpLabel: agent.viewpoint?.label ?? null,
+                stance: voteStance,
+                proposal,
               });
 
               if (cfg.turnDelayMs > 0) await new Promise(r => setTimeout(r, cfg.turnDelayMs));
+            } // end speakers
+
+            // ---- cluster consensus from votes ----
+            const byProp: Record<string, { yes: number; total: number }> = {};
+            for (const v of votes) {
+              if (!v.proposal) continue;
+              const k = normalize(v.proposal);
+              byProp[k] ??= { yes: 0, total: 0 };
+              if (v.stance !== 0) byProp[k].total++;
+              if (v.stance > 0) byProp[k].yes++;
             }
-          }
+            let bestK = ""; let best = { yes: 0, total: 0 };
+            for (const [k, v] of Object.entries(byProp)) {
+              if (v.yes > best.yes) { bestK = k; best = v; }
+            }
+            if (best.total > 0) {
+              const support = best.yes / best.total;
+              if (support >= CONSENSUS_THRESH) {
+                consensusOut.push({ size: comp.length, support, proposal: bestK });
+              }
+            }
+          } // end comps
 
           const sizes = comps.map(c => c.length);
-          send({ type: "telemetry", turn, activeCount: active.size, clusters: sizes, meanCluster: (sizes.reduce((a, b) => a + b, 0) / (sizes.length || 1)) });
-        }
+          send({
+            type: "telemetry",
+            turn,
+            activeCount: active.size,
+            clusters: sizes,
+            meanCluster: (sizes.reduce((a, b) => a + b, 0) / (sizes.length || 1)),
+            consensus: consensusOut,
+          });
+        } // end turns
 
         send({ type: "done" });
         controller.close();
