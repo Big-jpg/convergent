@@ -3,18 +3,24 @@
 import { useState } from 'react';
 
 export type SimConfig = {
-  agentCount: number;              // how many agents active at start
-  maxTurns: number;                // total turns budget
-  maxContextMessages: number;      // rolling context window (messages)
-  maxTokens: number;               // per-reply token cap
-  temperature: number;             // base temp for all agents (quick global)
-  joinProb: number;                // per-turn chance an inactive agent joins
-  leaveProb: number;               // per-turn chance a random active agent leaves
-  turnDelayMs: number;             // delay between agent replies (UX pacing)
-  model: 'gpt-4o-mini' | 'gpt-4o'; // quick toggle for speed vs quality
-  goal: string;                    // discussion goal/topic
+  agentCount: number;
+  maxTurns: number;
+  maxContextMessages: number;
+  maxTokens: number;
+  temperature: number;
+  joinProb: number;
+  leaveProb: number;
+  turnDelayMs: number;
+  model: 'gpt-4o-mini' | 'gpt-4o';
+  goal: string;
+  // NEW — boid params
+  talkRadius: number;          // only agents within this distance can converse
+  perception: number;          // neighbor sensing radius for boid forces
+  maxSpeed: number;            // clamp velocity
+  alignW: number;              // alignment weight
+  cohereW: number;             // cohesion weight
+  separateW: number;           // separation weight
 };
-
 type Props = {
   running: boolean;
   onStart: (cfg: SimConfig) => void;
@@ -29,10 +35,17 @@ const defaults: SimConfig = {
   temperature: 0.6,
   joinProb: 0.25,
   leaveProb: 0.15,
-  turnDelayMs: 200,
+  turnDelayMs: 120,
   model: 'gpt-4o-mini',
   goal:
     'Identify the fastest viable path to minimum-operational lunar power by 2040 (trade solar vs nuclear vs hybrid).',
+  // NEW
+  talkRadius: 0.28,
+  perception: 0.45,
+  maxSpeed: 0.035,
+  alignW: 0.8,
+  cohereW: 0.6,
+  separateW: 1.2,
 };
 
 export default function ControlsPanel({ running, onStart, onStop }: Props) {
@@ -40,8 +53,8 @@ export default function ControlsPanel({ running, onStart, onStop }: Props) {
 
   const bind =
     <K extends keyof SimConfig>(key: K) =>
-    (v: SimConfig[K]) =>
-      setCfg((c) => ({ ...c, [key]: v }));
+      (v: SimConfig[K]) =>
+        setCfg((c) => ({ ...c, [key]: v }));
 
   return (
     <div className="bg-slate-900 text-slate-100 p-4 space-y-4 border-l border-slate-800 h-full">
@@ -136,6 +149,60 @@ export default function ControlsPanel({ running, onStart, onStop }: Props) {
             onChange={(e) => bind('turnDelayMs')(parseInt(e.target.value || '0', 10))}
             disabled={running}
           />
+        </label>
+
+        <label className="block text-sm">
+          Talk radius
+          <input type="number" step="0.01" min={0.05} max={1}
+            className="mt-1 w-full bg-slate-800 rounded p-2"
+            value={cfg.talkRadius}
+            onChange={(e) => bind('talkRadius')(parseFloat(e.target.value || '0'))}
+            disabled={running} />
+        </label>
+
+        <label className="block text-sm">
+          Perception
+          <input type="number" step="0.01" min={0.1} max={1.5}
+            className="mt-1 w-full bg-slate-800 rounded p-2"
+            value={cfg.perception}
+            onChange={(e) => bind('perception')(parseFloat(e.target.value || '0'))}
+            disabled={running} />
+        </label>
+
+        <label className="block text-sm">
+          Max speed
+          <input type="number" step="0.005" min={0.005} max={0.1}
+            className="mt-1 w-full bg-slate-800 rounded p-2"
+            value={cfg.maxSpeed}
+            onChange={(e) => bind('maxSpeed')(parseFloat(e.target.value || '0'))}
+            disabled={running} />
+        </label>
+
+        <label className="block text-sm">
+          Align W
+          <input type="number" step="0.1" min={0} max={3}
+            className="mt-1 w-full bg-slate-800 rounded p-2"
+            value={cfg.alignW}
+            onChange={(e) => bind('alignW')(parseFloat(e.target.value || '0'))}
+            disabled={running} />
+        </label>
+
+        <label className="block text-sm">
+          Cohere W
+          <input type="number" step="0.1" min={0} max={3}
+            className="mt-1 w-full bg-slate-800 rounded p-2"
+            value={cfg.cohereW}
+            onChange={(e) => bind('cohereW')(parseFloat(e.target.value || '0'))}
+            disabled={running} />
+        </label>
+
+        <label className="block text-sm">
+          Separate W
+          <input type="number" step="0.1" min={0} max={3}
+            className="mt-1 w-full bg-slate-800 rounded p-2"
+            value={cfg.separateW}
+            onChange={(e) => bind('separateW')(parseFloat(e.target.value || '0'))}
+            disabled={running} />
         </label>
 
         <label className="block text-sm">
