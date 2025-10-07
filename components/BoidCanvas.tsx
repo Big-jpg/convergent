@@ -8,7 +8,7 @@ import * as THREE from 'three';
 
 // --- helpers ---
 function lerp01(a: number, b: number, t: number) { return a + (b - a) * Math.min(1, Math.max(0, t)); }
-function glowIntensity(last?: number, now = Date.now(), halfLife = 3200) { // was 900
+function glowIntensity(last?: number, now = Date.now(), halfLife = 5000) { // was 900
   if (!last) return 0;
   const dt = Math.max(0, now - last);
   const k = Math.log(2) / halfLife;
@@ -58,13 +58,13 @@ function Agent({
               color: 'white',
               border: '1px solid rgba(148,163,184,0.35)',
               borderRadius: 8,
-              padding: '4px 6px',          // smaller padding
-              maxWidth: 160,               // narrower
-              fontSize: 11,                // smaller type
-              lineHeight: 1.25,
+              padding: '3px 5px',        // smaller
+              maxWidth: 140,             // narrower
+              fontSize: 10,              // smaller font
+              lineHeight: 1.22,
               boxShadow: '0 2px 8px rgba(0,0,0,0.35)',
               opacity: gi,
-              transform: `scale(${0.92 + gi * 0.12})`,
+              transform: `scale(${0.9 + gi * 0.1})`,
               pointerEvents: 'none',
               whiteSpace: 'pre-wrap',
             }}
