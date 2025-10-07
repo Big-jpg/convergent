@@ -12,29 +12,29 @@ type EventPayload =
   | { type: 'start'; goal: string; config: any }
   | { type: 'pos'; positions: Record<string, [number, number]> }
   | {
-      type: 'agent_message';
-      turn: number;
-      agent: string;
-      name: string;
-      color: string;
-      text: string;
-      proj: number[];
-      active: string[];
-      // new metadata
-      vpLabel?: string | null;
-      stance?: number; // -1 | 0 | +1
-      proposal?: string;
-    }
+    type: 'agent_message';
+    turn: number;
+    agent: string;
+    name: string;
+    color: string;
+    text: string;
+    proj: number[];
+    active: string[];
+    // new metadata
+    vpLabel?: string | null;
+    stance?: number; // -1 | 0 | +1
+    proposal?: string;
+  }
   | {
-      type: 'telemetry';
-      turn: number;
-      activeCount: number;
-      avgSimilarity?: number;
-      clusters?: number[];
-      meanCluster?: number;
-      // new: per-cluster consensus (already normalized to 0..1 support)
-      consensus?: ConsensusItem[];
-    }
+    type: 'telemetry';
+    turn: number;
+    activeCount: number;
+    avgSimilarity?: number;
+    clusters?: number[];
+    meanCluster?: number;
+    // new: per-cluster consensus (already normalized to 0..1 support)
+    consensus?: ConsensusItem[];
+  }
   | { type: 'agent_join'; turn: number; agent: string; name: string; color: string }
   | { type: 'agent_leave'; turn: number; agent: string }
   | { type: 'done' }
@@ -76,7 +76,7 @@ export default function FlockPage() {
     setStatus('Stopped.');
     try {
       await readerRef.current?.cancel();
-    } catch {}
+    } catch { }
   };
 
   const start = async (cfg: SimConfig) => {
@@ -93,7 +93,12 @@ export default function FlockPage() {
     const res = await fetch('/api/agents', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(cfg),
+      body: JSON.stringify({
+        ...cfg,
+        adaptWeights: cfg.adaptWeights,
+        perAgentWeights: cfg.perAgentWeights,
+        adaptRate: cfg.adaptRate,
+      }),
     });
 
     if (!res.body) {

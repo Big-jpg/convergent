@@ -32,6 +32,11 @@ type SimConfig = {
   // Viewpoints & variance
   viewpoints?: ViewCard[];
   tempJitter?: number;
+
+  // --- New: adaptive dynamics ---
+  adaptWeights?: boolean;        // enable per-turn adaptation
+  adaptRate?: number;            // 0..1 small coefficient (e.g., 0.15)
+  perAgentWeights?: boolean;     // start each agent with its own weight profile
 };
 
 type Agent = {
@@ -41,6 +46,17 @@ type Agent = {
   model: any; // underlying model handle from @ai-sdk/openai
   persona: Persona;
   viewpoint?: ViewCard;
+};
+
+// Per-agent weight profile (motion + conversational thermals)
+type AgentWeights = {
+  alignW: number;
+  cohereW: number;
+  separateW: number;
+  wanderW: number;
+  tempBias: number;      // additive temperature bias
+  stubbornness: number;  // 0..1 (higher = resists convergence)
+  volatility: number;    // 0..1 (higher = changes faster)
 };
 
 const COLORS = [
@@ -111,6 +127,31 @@ function parseViewpoints(raw: unknown): ViewCard[] {
   return out;
 }
 
+function clamp01(x: number) { return Math.max(0, Math.min(1, x)); }
+
+function weightsFromTraits(tr: VoiceTraits): AgentWeights {
+  // defaults (balanced)
+  let alignW = 0.8, cohereW = 0.7, separateW = 1.0, wanderW = 0.45, tempBias = 0.0;
+  let stubbornness = 0.5, volatility = 0.5;
+
+  switch (tr.direction) {
+    case "decider":    alignW = 0.9; cohereW = 0.6; separateW = 1.35; stubbornness = 0.8; volatility = 0.2; break;
+    case "explorer":   alignW = 0.6; cohereW = 0.85; separateW = 1.0;  stubbornness = 0.4; volatility = 0.7; break;
+    case "wanderer":   alignW = 0.7; cohereW = 0.7;  separateW = 0.95; stubbornness = 0.3; volatility = 0.8; wanderW = 0.6; break;
+    default: break;
+  }
+  if (tr.rigor === "data")      { alignW += 0.05; separateW += 0.05; }
+  if (tr.humor === "playful")   { tempBias += 0.05; }
+  if (tr.humor === "dry")       { tempBias += 0.02; }
+
+  return {
+    alignW, cohereW, separateW, wanderW,
+    tempBias,
+    stubbornness: clamp01(stubbornness),
+    volatility: clamp01(volatility),
+  };
+}
+
 /** ---------- Topic anchoring helpers ---------- */
 const STOPWORDS = new Set([
   "the","a","an","to","and","or","for","of","in","by","on","with","at","as","is","are","be","was","were","that","this","these","those","from","about","into","over","under","vs","versus","within","out","up","down","how","what","when","where","why","which"
@@ -157,16 +198,16 @@ function pickMove(tr: VoiceTraits): Move {
 export async function POST(req: Request) {
   const body = await req.json().catch(() => ({}));
   const cfg: SimConfig = {
-    agentCount: clamp(body?.agentCount ?? body?.config?.agentCount ?? 3, 2, 12),
-    maxTurns: clamp(body?.maxTurns ?? body?.config?.maxTurns ?? 6, 1, 50),
-    maxContextMessages: clamp(body?.maxContextMessages ?? body?.config?.maxContextMessages ?? 8, 2, 50),
-    maxTokens: clamp(body?.maxTokens ?? body?.config?.maxTokens ?? 160, 48, 400),
-    temperature: clamp(body?.temperature ?? body?.config?.temperature ?? 0.6, 0, 1.5),
-    joinProb: clamp(body?.joinProb ?? body?.config?.joinProb ?? 0.25, 0, 1),
-    leaveProb: clamp(body?.leaveProb ?? body?.config?.leaveProb ?? 0.15, 0, 1),
-    turnDelayMs: clamp(body?.turnDelayMs ?? body?.config?.turnDelayMs ?? 120, 0, 3000),
-    model: (body?.model ?? body?.config?.model ?? "gpt-4o-mini"),
-    goal: body?.goal ?? body?.config?.goal ?? "Determine the most sustainable energy source for a lunar outpost by 2040.",
+    agentCount: clamp(body?.agentCount ?? 3, 2, 12),
+    maxTurns: clamp(body?.maxTurns ?? 6, 1, 50),
+    maxContextMessages: clamp(body?.maxContextMessages ?? 8, 2, 50),
+    maxTokens: clamp(body?.maxTokens ?? 160, 48, 400),
+    temperature: clamp(body?.temperature ?? 0.6, 0, 1.5),
+    joinProb: clamp(body?.joinProb ?? 0.25, 0, 1),
+    leaveProb: clamp(body?.leaveProb ?? 0.15, 0, 1),
+    turnDelayMs: clamp(body?.turnDelayMs ?? 120, 0, 3000),
+    model: (body?.model ?? "gpt-4o-mini"),
+    goal: body?.goal ?? "Determine the most sustainable energy source for a lunar outpost by 2040.",
     talkRadius: clamp(body?.talkRadius ?? 0.28, 0.05, 1),
     perception: clamp(body?.perception ?? 0.45, 0.1, 1.5),
     maxSpeed: clamp(body?.maxSpeed ?? 0.035, 0.005, 0.1),
@@ -177,8 +218,11 @@ export async function POST(req: Request) {
     speakRate: clamp(body?.speakRate ?? 0.6, 0.1, 1),
     wanderW: clamp(body?.wanderW ?? 0.45, 0, 1.5),
     speedJitter: clamp(body?.speedJitter ?? 0.3, 0, 0.6),
-    viewpoints: parseViewpoints(body?.viewpoints ?? body?.config?.viewpoints ?? []),
+    viewpoints: parseViewpoints(body?.viewpoints ?? []),
     tempJitter: clamp(body?.tempJitter ?? 0.2, 0, 0.8),
+    adaptWeights: !!(body?.adaptWeights ?? true),
+    adaptRate: clamp(body?.adaptRate ?? 0.15, 0, 1),
+    perAgentWeights: !!(body?.perAgentWeights ?? true),
   };
 
   // compute anchor terms from goal
@@ -197,6 +241,20 @@ export async function POST(req: Request) {
       viewpoint: vp,
     };
   });
+
+  // Per-agent dynamic weights (either derived from traits or start from globals)
+  const dyn: Record<string, AgentWeights> = {};
+  for (const a of pool) {
+    if (cfg.perAgentWeights) {
+      dyn[a.id] = weightsFromTraits(a.viewpoint?.traits ?? {});
+    } else {
+      dyn[a.id] = {
+        alignW: cfg.alignW, cohereW: cfg.cohereW, separateW: cfg.separateW,
+        wanderW: cfg.wanderW, tempBias: 0,
+        stubbornness: 0.5, volatility: 0.5,
+      };
+    }
+  }
 
   // Per-agent speed cap jitter
   const speedMul: Record<string, number> = {};
@@ -237,6 +295,7 @@ export async function POST(req: Request) {
 
     for (const i of ids) {
       const p = pos[i], v = vel[i];
+      const w = dyn[i];
       let count = 0;
       let avgVel: [number, number] = [0, 0];
       let center: [number, number] = [0, 0];
@@ -261,22 +320,22 @@ export async function POST(req: Request) {
         const cohere = sub(setMag(sub(centroid, p), cfg.maxSpeed), v);
         const separate = setMag(sep, cfg.maxSpeed);
 
-        acc = add(acc, mul(align, cfg.alignW));
-        acc = add(acc, mul(cohere, cfg.cohereW));
-        acc = add(acc, mul(separate, cfg.separateW));
+        acc = add(acc, mul(align, w.alignW));
+        acc = add(acc, mul(cohere, w.cohereW));
+        acc = add(acc, mul(separate, w.separateW));
       }
 
       // interest pull
       let pull: [number, number] = [0, 0]; let hsum = 0;
       for (const j of ids) {
-        const w = heat[j] || 0; if (w <= 0.02 || j === i) continue;
-        hsum += w; pull = add(pull, mul(sub(pos[j], p), w));
+        const wh = heat[j] || 0; if (wh <= 0.02 || j === i) continue;
+        hsum += wh; pull = add(pull, mul(sub(pos[j], p), wh));
       }
       if (hsum > 0) acc = add(acc, setMag(pull, Math.min(cfg.maxSpeed * 0.6, 0.025)));
 
-      // wander
+      // wander (per-agent)
       const theta = Math.random() * Math.PI * 2;
-      acc = add(acc, mul(setMag([Math.cos(theta), Math.sin(theta)], Math.min(cfg.maxSpeed, 0.02)), cfg.wanderW));
+      acc = add(acc, mul(setMag([Math.cos(theta), Math.sin(theta)], Math.min(cfg.maxSpeed, 0.02)), w.wanderW));
 
       // integrate with per-agent cap
       let nv = add(v, mul(acc, dt));
@@ -373,32 +432,31 @@ export async function POST(req: Request) {
               const tRand = (cfg.tempJitter ?? 0.2) * (Math.random() * 2 - 1);
               const tr = agent.viewpoint?.traits ?? {};
               const humorKick = tr.humor === "playful" ? 0.05 : tr.humor === "dry" ? 0.02 : 0;
-              const effTemp = clamp(baseTemp + tRand + humorKick, 0, 1.5);
+              const effTemp = clamp(baseTemp + (dyn[agent.id]?.tempBias ?? 0) + tRand + humorKick, 0, 1.5);
 
               const move = pickMove(tr);
 
               const system = `
-You are ${agent.name}.
-Persona: ${personaStance.toUpperCase()} — ${styleNote}
-Viewpoint: ${agent.viewpoint?.label ?? "None"}${agent.viewpoint?.desc ? " — " + agent.viewpoint?.desc : ""}
+              You are ${agent.name}.
+              Persona: ${personaStance.toUpperCase()} — ${styleNote}
+              Viewpoint: ${agent.viewpoint?.label ?? "None"}${agent.viewpoint?.desc ? " — " + agent.viewpoint?.desc : ""}
 
-TOPIC (do not restate verbatim): ${cfg.goal}
-ANCHOR TERMS: ${anchors.join(", ")}
+              TOPIC (do not restate verbatim): ${cfg.goal}
+              ANCHOR TERMS: ${anchors.join(", ")}
 
-VOICE TRAITS
-- Humor: ${tr.humor ?? "none"}${tr.humor && tr.humor!=="none" ? " (one **very** short aside allowed occasionally)" : ""}
-- Naivety: ${tr.naivety ?? "med"}
-- Direction: ${tr.direction ?? "explorer"}
-- Rigor: ${tr.rigor ?? "balanced"}
-- Optimism: ${tr.optimism ?? "med"}
-- Snark: ${tr.snark ?? "low"}
+              VOICE TRAITS
+              - Humor: ${tr.humor ?? "none"}${tr.humor && tr.humor!=="none" ? " (one **very** short aside allowed occasionally)" : ""}
+              - Naivety: ${tr.naivety ?? "med"}
+              - Direction: ${tr.direction ?? "explorer"}
+              - Rigor: ${tr.rigor ?? "balanced"}
+              - Optimism: ${tr.optimism ?? "med"}
+              - Snark: ${tr.snark ?? "low"}
 
-TOPIC RULES
-- Stay tightly scoped to the TOPIC. Every point must connect back to it in at least one short clause.
-- Use at least one ANCHOR TERM when you make a claim or propose a step.
-- Avoid unrelated detours (e.g., generic policing/surveillance) unless you clearly tie them to the TOPIC via a named mechanism that affects the decision (cost, timeline, reliability, risk, etc.).
-- Keep it brief (<= ${cfg.maxTokens} tokens). Use 1–2 short paragraphs or a compact list.
-`.trim();
+              TOPIC RULES
+              - Stay tightly scoped to the TOPIC. Every point must connect back to it.
+              - Use at least one ANCHOR TERM when you make a claim or propose a step.
+              - Keep it brief (<= ${cfg.maxTokens} tokens). Use 1–2 short paragraphs or a compact list.
+              `.trim();
 
               const moveGuide =
                 move === "ASK" ? "Ask one sharp question and say why it matters."
@@ -415,19 +473,16 @@ TOPIC RULES
                 : `Address the cluster concisely.`;
 
               const prompt = `
-Cluster peers you can hear: ${comp.join(", ")}
+              Cluster peers you can hear: ${comp.join(", ")}
 
-Recent local context (last ${cfg.maxContextMessages} msgs):
-${ctx.map((m, i) => `#${i + 1} ${m.speaker}: ${m.text}`).join("\n")}
+              Recent local context (last ${cfg.maxContextMessages} msgs):
+              ${ctx.map((m, i) => `#${i + 1} ${m.speaker}: ${m.text}`).join("\n")}
 
-MOVE: ${move}. Guidance: ${moveGuide}. ${peerHint}
+              MOVE: ${move}. Guidance: ${moveGuide}. ${peerHint}
 
-Before you answer, quickly check: does your draft explicitly connect to the TOPIC using at least one ANCHOR TERM?
-- If not, add one brief bridging clause that ties your point back to the TOPIC.
-
-At the very end, append a single meta tag of the form:
-<META stance={-1|0|+1} proposal="very short title of the step you support or '' if none">
-`.trim();
+              At the very end, append a single meta tag of the form:
+              <META stance={-1|0|+1} proposal="very short title of the step you support or '' if none">
+              `.trim();
 
               const result = await generateText({
                 model: agent.model,
@@ -489,6 +544,44 @@ At the very end, append a single meta tag of the form:
               const support = best.yes / best.total;
               if (support >= CONSENSUS_THRESH) {
                 consensusOut.push({ size: comp.length, support, proposal: bestK });
+              }
+            }
+
+            // --- Adaptive drift: nudge weights of speakers in this cluster
+            if (cfg.adaptWeights && votes.length) {
+              for (let idx = 0; idx < speakers.length; idx++) {
+                const agentId = speakers[idx];
+                const agentW = dyn[agentId];
+                if (!agentW) continue;
+                const v = votes[idx];
+
+                // Determine agreement with winning proposal (if any)
+                const winner = bestK;
+                const agrees = winner && v.proposal && normalize(v.proposal) === winner && v.stance > 0;
+                const disagrees = winner && v.stance < 0 && normalize(v.proposal) === winner;
+
+                const rate = cfg.adaptRate! * (agrees || disagrees ? 1 : 0.5);
+                const resist = 1 - agentW.stubbornness;
+                const step = rate * (agentW.volatility * 0.6 + 0.4) * resist;
+
+                if (agrees) {
+                  agentW.alignW = clamp(agentW.alignW + 0.20 * step, 0, 3);
+                  agentW.cohereW = clamp(agentW.cohereW + 0.18 * step, 0, 3);
+                  agentW.separateW = clamp(agentW.separateW - 0.22 * step, 0, 3);
+                  agentW.wanderW  = clamp(agentW.wanderW  - 0.10 * step, 0, 1.5);
+                  agentW.tempBias = clamp(agentW.tempBias - 0.04 * step, -0.4, 0.6);
+                } else if (disagrees) {
+                  agentW.alignW = clamp(agentW.alignW - 0.12 * step, 0, 3);
+                  agentW.cohereW = clamp(agentW.cohereW - 0.10 * step, 0, 3);
+                  agentW.separateW = clamp(agentW.separateW + 0.25 * step, 0, 3);
+                  agentW.wanderW  = clamp(agentW.wanderW  + 0.12 * step, 0, 1.5);
+                  agentW.tempBias = clamp(agentW.tempBias + 0.05 * step, -0.4, 0.6);
+                } else {
+                  // Neutral: small homeostatic drift toward global cfg.
+                  agentW.alignW += (cfg.alignW - agentW.alignW) * 0.05 * rate;
+                  agentW.cohereW += (cfg.cohereW - agentW.cohereW) * 0.05 * rate;
+                  agentW.separateW += (cfg.separateW - agentW.separateW) * 0.05 * rate;
+                }
               }
             }
           } // end comps
