@@ -13,6 +13,7 @@
     "@ai-sdk/openai": "^2.0.43",
     "@react-three/drei": "^10.7.6",
     "@react-three/fiber": "^9.3.0",
+    "@vercel/analytics": "^1.5.0",
     "ai": "^5.0.60",
     "next": "15.5.4",
     "react": "19.1.0",
