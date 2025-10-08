@@ -2,7 +2,6 @@
 'use client';
 
 import { useRef, useState } from 'react';
-import { Analytics } from "@vercel/analytics/next"
 import BoidCanvas from '@/components/BoidCanvas';
 import ChatLog from '@/components/ChatLog';
 import ControlsPanel, { type SimConfig } from '@/components/ControlsPanel';
@@ -203,11 +202,9 @@ export default function FlockPage() {
       <aside className="bg-slate-900 text-slate-100 p-4 overflow-y-auto">
         <ChatLog messages={messages} />
       </aside>
-
       <aside>
         <ControlsPanel running={running} onStart={start} onStop={stop} />
       </aside>
-      <Analytics />
     </div>
   );
 }
