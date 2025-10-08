@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 
 export type SimConfig = {
   agentCount: number;
@@ -31,6 +31,11 @@ export type SimConfig = {
   // Multi-viewpoint + persona variance
   viewpoints: string[];
   tempJitter: number;   // per-agent temp variance (0..0.8)
+
+  // Adaptive dynamics
+  adaptWeights?: boolean;
+  perAgentWeights?: boolean;
+  adaptRate?: number;
 };
 
 type Props = {
@@ -40,20 +45,20 @@ type Props = {
 };
 
 const defaults: SimConfig = {
-  agentCount: 3,
-  maxTurns: 6,
-  maxContextMessages: 8,
-  maxTokens: 160,
-  temperature: 0.6,
-  joinProb: 0.25,
-  leaveProb: 0.15,
-  turnDelayMs: 120,
+  agentCount: 4,
+  maxTurns: 10,
+  maxContextMessages: 10,
+  maxTokens: 200,
+  temperature: 0.7,
+  joinProb: 0.20,
+  leaveProb: 0.10,
+  turnDelayMs: 200,
   model: 'gpt-4o-mini',
   goal:
-    'Identify the fastest viable path to minimum-operational lunar power by 2040 (trade solar vs nuclear vs hybrid).',
+    'Should governments implement universal basic income funded through AI taxation, or would that erode human ambition and innovation?',
 
   // Boids
-  talkRadius: 0.28,
+  talkRadius: 0.30,
   perception: 0.45,
   maxSpeed: 0.035,
   alignW: 0.8,
@@ -61,28 +66,181 @@ const defaults: SimConfig = {
   separateW: 1.2,
 
   // Dynamics
-  activityRate: 1.6,
+  activityRate: 1.4,
   speakRate: 0.6,
-  wanderW: 0.45,
-  speedJitter: 0.3,
+  wanderW: 0.50,
+  speedJitter: 0.25,
 
   // Viewpoints & variance
   viewpoints: [
-    'Viewpoint A: Maximize public safety',
-    'Viewpoint B: Maximize individual rights',
-    'Viewpoint C: Balance & evidence-driven',
+    'Authoritarian Left | humor=light, direction=decider, rigor=data, optimism=high',
+    'Libertarian Left | humor=playful, direction=explorer, rigor=anecdotal, naivety=high, optimism=med',
+    'Authoritarian Right | humor=dry, direction=decider, rigor=balanced, snark=high',
+    'Libertarian Right | humor=light, direction=wanderer, rigor=balanced, optimism=high',
   ],
-  tempJitter: 0.2,
+  tempJitter: 0.25,
+
+  // Adaptive
+  adaptWeights: true,
+  perAgentWeights: true,
+  adaptRate: 0.15,
 };
+
+/* ---------------- Presets ---------------- */
+
+type Preset = {
+  id: string;
+  name: string;
+  hint: string;
+  cfg: Partial<SimConfig>;
+  viewpoints?: string[];
+  goal?: string;
+};
+
+const PRESETS: Preset[] = [
+  {
+    id: 'political_compass',
+    name: 'Political Compass (4 corners)',
+    hint: 'Distinct factions, vivid debate, gradual convergence.',
+    goal:
+      'Should governments adopt UBI funded by AI taxation — or would that erode human ambition and innovation?',
+    viewpoints: [
+      'Authoritarian Left | humor=light, direction=decider, rigor=data',
+      'Libertarian Left | humor=playful, direction=explorer, rigor=anecdotal, naivety=high',
+      'Authoritarian Right | humor=dry, direction=decider, rigor=balanced, snark=high',
+      'Libertarian Right | humor=light, direction=wanderer, rigor=balanced, optimism=high',
+    ],
+    cfg: {
+      agentCount: 4,
+      maxTurns: 10,
+      talkRadius: 0.30,
+      perception: 0.45,
+      maxSpeed: 0.035,
+      alignW: 0.6,
+      cohereW: 0.7,
+      separateW: 1.3,
+      activityRate: 1.4,
+      speakRate: 0.7,
+      wanderW: 0.5,
+      speedJitter: 0.25,
+      tempJitter: 0.25,
+      adaptWeights: true,
+      perAgentWeights: true,
+      adaptRate: 0.18,
+    },
+  },
+  {
+    id: 'polarized_debate',
+    name: 'Polarized Debate',
+    hint: 'Hard factions, slower consensus, sharper motion.',
+    cfg: {
+      agentCount: 6,
+      maxTurns: 12,
+      talkRadius: 0.24,
+      perception: 0.42,
+      alignW: 0.55,
+      cohereW: 0.55,
+      separateW: 1.6,
+      wanderW: 0.55,
+      activityRate: 1.6,
+      speakRate: 0.65,
+      tempJitter: 0.30,
+      adaptWeights: true,
+      perAgentWeights: true,
+      adaptRate: 0.12,
+    },
+  },
+  {
+    id: 'consensus_workshop',
+    name: 'Consensus Workshop',
+    hint: 'Cooperative behavior; finds middle quickly.',
+    cfg: {
+      agentCount: 5,
+      maxTurns: 8,
+      talkRadius: 0.36,
+      perception: 0.5,
+      alignW: 1.0,
+      cohereW: 0.85,
+      separateW: 0.9,
+      wanderW: 0.3,
+      activityRate: 1.2,
+      speakRate: 0.55,
+      tempJitter: 0.18,
+      adaptWeights: true,
+      perAgentWeights: true,
+      adaptRate: 0.2,
+    },
+  },
+  {
+    id: 'chaotic_agora',
+    name: 'Chaotic Agora',
+    hint: 'Noisy square; ideas collide; unpredictable arcs.',
+    cfg: {
+      agentCount: 8,
+      maxTurns: 10,
+      talkRadius: 0.26,
+      perception: 0.48,
+      alignW: 0.5,
+      cohereW: 0.55,
+      separateW: 1.45,
+      wanderW: 0.9,
+      speedJitter: 0.35,
+      activityRate: 1.8,
+      speakRate: 0.8,
+      tempJitter: 0.35,
+      adaptWeights: true,
+      perAgentWeights: true,
+      adaptRate: 0.22,
+    },
+  },
+  {
+    id: 'calm_seminar',
+    name: 'Calm Seminar',
+    hint: 'Gentle motion, clear turn-taking, low heat.',
+    cfg: {
+      agentCount: 4,
+      maxTurns: 8,
+      talkRadius: 0.34,
+      perception: 0.46,
+      alignW: 0.8,
+      cohereW: 0.7,
+      separateW: 1.0,
+      wanderW: 0.25,
+      activityRate: 1.0,
+      speakRate: 0.45,
+      tempJitter: 0.15,
+      adaptWeights: true,
+      perAgentWeights: true,
+      adaptRate: 0.10,
+      turnDelayMs: 260,
+    },
+  },
+];
 
 export default function ControlsPanel({ running, onStart, onStop }: Props) {
   const [cfg, setCfg] = useState<SimConfig>(defaults);
   const [vpText, setVpText] = useState<string>(defaults.viewpoints.join('\n'));
+  const [activePreset, setActivePreset] = useState<string>('political_compass');
 
   const bind =
     <K extends keyof SimConfig>(key: K) =>
       (v: SimConfig[K]) =>
         setCfg((c) => ({ ...c, [key]: v }));
+
+  const applyPreset = (presetId: string) => {
+    const p = PRESETS.find(p => p.id === presetId);
+    if (!p) return;
+    setActivePreset(presetId);
+    setCfg((c) => {
+      const next: SimConfig = { ...c, ...p.cfg };
+      if (p.goal) next.goal = p.goal;
+      if (p.viewpoints) {
+        next.viewpoints = p.viewpoints;
+        setVpText(p.viewpoints.join('\n'));
+      }
+      return next;
+    });
+  };
 
   const start = () => {
     const viewpoints = vpText
@@ -92,9 +250,38 @@ export default function ControlsPanel({ running, onStart, onStop }: Props) {
     onStart({ ...cfg, viewpoints });
   };
 
+  const presetHint = useMemo(
+    () => PRESETS.find(p => p.id === activePreset)?.hint ?? '',
+    [activePreset]
+  );
+
   return (
     <div className="bg-slate-900 text-slate-100 p-4 space-y-4 border-l border-slate-800 h-full">
       <h2 className="text-lg font-semibold">Controls</h2>
+
+      {/* Presets */}
+      <div className="space-y-2">
+        <div className="text-sm font-medium">Presets</div>
+        <div className="flex flex-wrap gap-2">
+          {PRESETS.map(p => (
+            <button
+              key={p.id}
+              disabled={running}
+              onClick={() => applyPreset(p.id)}
+              className={[
+                "px-3 py-1.5 rounded text-sm border transition",
+                activePreset === p.id
+                  ? "bg-emerald-600 border-emerald-500"
+                  : "bg-slate-800 border-slate-700 hover:bg-slate-700"
+              ].join(' ')}
+              title={p.hint}
+            >
+              {p.name}
+            </button>
+          ))}
+        </div>
+        <p className="text-[11px] text-slate-400">{presetHint}</p>
+      </div>
 
       <label className="block text-sm">
         Goal
@@ -127,13 +314,45 @@ Pragmatic Center | direction=wanderer, rigor=balanced`}
           <code>snark=low|med|high</code>.
         </p>
       </label>
+
+      {/* ───────── Adaptation ───────── */}
+      <div className="mt-4 grid grid-cols-2 gap-3">
+        <div className="col-span-2 font-semibold">Adaptation</div>
+        <label className="flex items-center gap-2">
+          <input
+            type="checkbox"
+            checked={!!cfg.adaptWeights}
+            onChange={e => setCfg(v => ({ ...v, adaptWeights: e.target.checked }))}
+            disabled={running}
+          />
+          Per-turn adaptive weights
+        </label>
+        <label className="flex items-center gap-2">
+          <input
+            type="checkbox"
+            checked={!!cfg.perAgentWeights}
+            onChange={e => setCfg(v => ({ ...v, perAgentWeights: e.target.checked }))}
+            disabled={running}
+          />
+          Start from trait-based profiles
+        </label>
+        <div className="col-span-2">
+          <div className="text-sm">Adapt rate: {(cfg.adaptRate ?? 0).toFixed(2)}</div>
+          <input
+            type="range" min={0} max={1} step={0.01}
+            value={cfg.adaptRate ?? 0}
+            onChange={e => setCfg(v => ({ ...v, adaptRate: parseFloat(e.target.value) }))}
+            disabled={running}
+          />
+        </div>
+      </div>
+
+      {/* --- Quick knobs --- */}
       <div className="grid grid-cols-2 gap-3">
         <label className="block text-sm">
           Agents (start)
           <input
-            type="number"
-            min={2}
-            max={12}
+            type="number" min={2} max={12}
             className="mt-1 w-full bg-slate-800 rounded p-2"
             value={cfg.agentCount}
             onChange={(e) => bind('agentCount')(parseInt(e.target.value || '0', 10))}
@@ -144,9 +363,7 @@ Pragmatic Center | direction=wanderer, rigor=balanced`}
         <label className="block text-sm">
           Max turns
           <input
-            type="number"
-            min={1}
-            max={50}
+            type="number" min={1} max={50}
             className="mt-1 w-full bg-slate-800 rounded p-2"
             value={cfg.maxTurns}
             onChange={(e) => bind('maxTurns')(parseInt(e.target.value || '0', 10))}
@@ -157,9 +374,7 @@ Pragmatic Center | direction=wanderer, rigor=balanced`}
         <label className="block text-sm">
           Context window (msgs)
           <input
-            type="number"
-            min={2}
-            max={50}
+            type="number" min={2} max={50}
             className="mt-1 w-full bg-slate-800 rounded p-2"
             value={cfg.maxContextMessages}
             onChange={(e) => bind('maxContextMessages')(parseInt(e.target.value || '0', 10))}
@@ -170,9 +385,7 @@ Pragmatic Center | direction=wanderer, rigor=balanced`}
         <label className="block text-sm">
           Max tokens / reply
           <input
-            type="number"
-            min={48}
-            max={400}
+            type="number" min={48} max={400}
             className="mt-1 w-full bg-slate-800 rounded p-2"
             value={cfg.maxTokens}
             onChange={(e) => bind('maxTokens')(parseInt(e.target.value || '0', 10))}
@@ -183,10 +396,7 @@ Pragmatic Center | direction=wanderer, rigor=balanced`}
         <label className="block text-sm">
           Temperature
           <input
-            type="number"
-            step="0.05"
-            min={0}
-            max={1.5}
+            type="number" step="0.05" min={0} max={1.5}
             className="mt-1 w-full bg-slate-800 rounded p-2"
             value={cfg.temperature}
             onChange={(e) => bind('temperature')(parseFloat(e.target.value || '0'))}
@@ -197,9 +407,7 @@ Pragmatic Center | direction=wanderer, rigor=balanced`}
         <label className="block text-sm">
           Turn delay (ms)
           <input
-            type="number"
-            min={0}
-            max={3000}
+            type="number" min={0} max={3000}
             className="mt-1 w-full bg-slate-800 rounded p-2"
             value={cfg.turnDelayMs}
             onChange={(e) => bind('turnDelayMs')(parseInt(e.target.value || '0', 10))}
